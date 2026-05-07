@@ -365,3 +365,100 @@ class _STZMPExportModule(nn.Module):
             dim=-1,
         )
         return self.student_actor(actor_input)
+
+
+def export_stzmp_policy_debug_as_onnx(
+    policy: object,
+    path: str,
+    filename: str = "policy_debug.onnx",
+    verbose: bool = False,
+) -> None:
+    """Export an :class:`STZMPStudentTeacher` debug ONNX with attention weights.
+
+    Identical to :func:`export_stzmp_policy_as_onnx` but the model returns
+    **two** outputs:
+
+    * ``"actions"`` — ``[1, num_actions]`` joint position targets.
+    * ``"attn_weights"`` — ``[1, num_legs]`` cross-attention scores averaged
+      over heads.  Entry ``[0, l]`` is the weight the base token places on leg
+      ``l``.  Useful for visualising which legs drive the ZMP estimate.
+
+    Args:
+        policy: The ``STZMPStudentTeacher`` module returned by the runner.
+        path: Directory to write the file to (created if needed).
+        filename: Output filename. Defaults to ``"policy_debug.onnx"``.
+        verbose: Print ONNX graph summary. Defaults to ``False``.
+    """
+    module = _STZMPDebugExportModule(policy)
+    os.makedirs(path, exist_ok=True)
+    module.to("cpu").eval()
+    example = torch.zeros(1, module._obs_dim)
+    torch.onnx.export(
+        module,
+        example,
+        os.path.join(path, filename),
+        export_params=True,
+        opset_version=18,
+        verbose=verbose,
+        input_names=["obs"],
+        output_names=["actions", "attn_weights"],
+        dynamic_axes={},
+    )
+    print(f"[STZMP export] Debug ONNX (actions + attn) saved → {os.path.join(path, filename)}")
+
+
+class _STZMPDebugExportModule(_STZMPExportModule):
+    """Like :class:`_STZMPExportModule` but returns ``(actions, attn_weights)``.
+
+    The second output ``attn_weights`` has shape ``[1, num_legs]`` (heads
+    averaged, query dimension squeezed).  Intended for on-robot logging and
+    paper figures — not used in production inference.
+    """
+
+    def forward(self, flat_obs: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        B = flat_obs.shape[0]
+        H = self._history_len
+        N = self._num_joints
+        idx_cur = self._newest_step_idx
+
+        base_lin_vel = flat_obs[:, self._blv_s : self._blv_e]
+        base_ang_vel = flat_obs[:, self._bav_s : self._bav_e]
+        proj_gravity = flat_obs[:, self._pg_s : self._pg_e]
+        command = flat_obs[:, self._cmd_s : self._cmd_e]
+        joint_pos_hist = flat_obs[:, self._jph_s : self._jph_e].reshape(B, H, N)
+        joint_vel_hist = flat_obs[:, self._jvh_s : self._jvh_e].reshape(B, H, N)
+        action_hist = flat_obs[:, self._ah_s : self._ah_e].reshape(B, H, N)
+        height_scan = flat_obs[:, self._hs_s : self._hs_e]
+
+        leg_token_list = []
+        for i in range(self._num_legs):
+            idx = getattr(self, f"_leg_idx_{i}")
+            q = joint_pos_hist[:, :, idx].reshape(B, -1)
+            dq = joint_vel_hist[:, :, idx].reshape(B, -1)
+            a = action_hist[:, :, idx].reshape(B, -1)
+            leg_token_list.append(torch.cat([q, dq, a], dim=-1))
+        leg_tokens = torch.stack(leg_token_list, dim=1)
+
+        base_current = torch.cat([proj_gravity, base_ang_vel], dim=-1)
+
+        # Request attention weights (need_weights=True branch)
+        mu_zmp, logvar_zmp, _, attn_weights = self.encoder(
+            leg_tokens, base_current, deterministic=True, return_attn_weights=True
+        )
+        # attn_weights: [B, 1, num_legs] → [B, num_legs]
+        assert attn_weights is not None
+        attn_weights = attn_weights.squeeze(1)
+
+        joint_pos_cur = joint_pos_hist[:, idx_cur, :]
+        joint_vel_cur = joint_vel_hist[:, idx_cur, :]
+        actions_cur = action_hist[:, idx_cur, :]
+
+        actor_input = torch.cat(
+            [
+                joint_pos_cur, joint_vel_cur, actions_cur,
+                base_lin_vel, base_ang_vel, proj_gravity,
+                command, height_scan, mu_zmp, logvar_zmp,
+            ],
+            dim=-1,
+        )
+        return self.student_actor(actor_input), attn_weights
