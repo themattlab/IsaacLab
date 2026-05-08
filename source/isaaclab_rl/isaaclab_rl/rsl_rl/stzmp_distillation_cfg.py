@@ -129,6 +129,15 @@ class RslRlSTZMPAlgorithmCfg(RslRlDistillationAlgorithmCfg):
     """Key in the observation TensorDict that holds ``delta_zmp_star (Δx, Δy)``.
     Must match the corresponding entry in ``obs_groups`` of the runner config."""
 
+    zmp_target_scale: float = 10.0
+    """Multiplier applied to ``delta_zmp_star`` before computing the NLL loss.
+
+    Raw ZMP shifts are typically 0.01–0.1 m, which produces very small gradients.
+    Scaling to 0.1–1.0 gives the NLL a stronger signal without changing the BC
+    loss or rollout behaviour.  The encoder learns to predict in these scaled
+    units; divide ``mu_zmp`` outputs by this factor to recover metres.
+    Default: 10."""
+
     log_sigma2_load_threshold: float = 0.02
     """**Logging only — has no effect on the loss or gradients.**
 
@@ -136,8 +145,8 @@ class RslRlSTZMPAlgorithmCfg(RslRlDistillationAlgorithmCfg):
     as "under load" when computing the ``sigma2_free`` / ``sigma2_load`` /
     ``sigma2_ratio`` / ``zmp_err_load`` diagnostic metrics logged to W&B.
 
-    Set to roughly the minimum ZMP shift your force curriculum produces.
-    Default 0.02 = 2 cm. Increase if your ZMP targets are smaller in scale."""
+    Always in unscaled metres — independent of ``zmp_target_scale``.
+    Default 0.02 = 2 cm."""
 
 
 # ---------------------------------------------------------------------------
