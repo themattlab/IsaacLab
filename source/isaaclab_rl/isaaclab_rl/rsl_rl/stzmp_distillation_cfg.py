@@ -86,6 +86,19 @@ class RslRlSTZMPStudentTeacherCfg:
     teacher_hidden_dims: list[int] = MISSING
     """Hidden layer widths for the teacher MLP."""
 
+    # ── Action history decoupling ─────────────────────────────────────────────
+    actor_action_history_steps: int = 3
+    """Number of recent action steps fed to the student actor MLP.
+    The encoder leg tokens always receive the full ``history_len`` steps;
+    this controls only the actor's short-range action context window.
+    Default: 3."""
+
+    # ── Leg naming (for debug ONNX metadata) ─────────────────────────────────
+    leg_names: list[str] = MISSING
+    """Human-readable leg names in the same order as ``leg_joint_indices``.
+    Used to label ``attn_weights`` outputs in the debug ONNX metadata JSON.
+    Example for Spot: ``["FL", "FR", "RL", "RR"]``."""
+
     # ── Normalization ────────────────────────────────────────────────────────
     teacher_obs_normalization: bool = False
     """Apply empirical obs normalisation to teacher inputs."""

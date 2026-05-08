@@ -4,6 +4,7 @@
 # SPDX-License-Identifier: BSD-3-Clause
 
 import copy
+import json
 import os
 
 import torch
@@ -314,6 +315,10 @@ class _STZMPExportModule(nn.Module):
         self._num_joints: int = policy.num_joints
         self._newest_step_idx: int = policy.newest_step_idx
 
+        # Actor action window (encoder always sees full H; actor sees short K window)
+        self._actor_act_start: int = policy._actor_act_start
+        self._actor_act_end: int = policy._actor_act_end
+
         # Total flat obs dimension (used to build the dummy tensor for export)
         self._obs_dim: int = policy._sl_height_scan[1]
 
@@ -343,22 +348,21 @@ class _STZMPExportModule(nn.Module):
             leg_token_list.append(torch.cat([q, dq, a], dim=-1))
         leg_tokens = torch.stack(leg_token_list, dim=1)  # [B, num_legs, token_dim]
 
-        # ── Base token: [projected_gravity | base_ang_vel] ───────────────────
-        base_current = torch.cat([proj_gravity, base_ang_vel], dim=-1)
+        # ── Task-conditioned base token: [gravity | ang_vel | lin_vel | cmd] ─
+        base_current = torch.cat([proj_gravity, base_ang_vel, base_lin_vel, command], dim=-1)
 
         # ── Encoder (deterministic — mu_zmp is used directly) ────────────────
-        # need_weights=False (default) keeps the traced graph lean for deployment
         mu_zmp, logvar_zmp, _, _attn = self.encoder(leg_tokens, base_current, deterministic=True)
 
-        # ── Current-step joint state ─────────────────────────────────────────
+        # ── Current-step joint state + recent action window ──────────────────
         joint_pos_cur = joint_pos_hist[:, idx_cur, :]
         joint_vel_cur = joint_vel_hist[:, idx_cur, :]
-        actions_cur = action_hist[:, idx_cur, :]
+        actions_recent = action_hist[:, self._actor_act_start : self._actor_act_end, :].reshape(B, -1)
 
         # ── Student actor ────────────────────────────────────────────────────
         actor_input = torch.cat(
             [
-                joint_pos_cur, joint_vel_cur, actions_cur,
+                joint_pos_cur, joint_vel_cur, actions_recent,
                 base_lin_vel, base_ang_vel, proj_gravity,
                 command, height_scan, mu_zmp, logvar_zmp,
             ],
@@ -373,15 +377,19 @@ def export_stzmp_policy_debug_as_onnx(
     filename: str = "policy_debug.onnx",
     verbose: bool = False,
 ) -> None:
-    """Export an :class:`STZMPStudentTeacher` debug ONNX with attention weights.
+    """Export an :class:`STZMPStudentTeacher` debug ONNX with all diagnostic outputs.
 
-    Identical to :func:`export_stzmp_policy_as_onnx` but the model returns
-    **two** outputs:
+    Returns **four** outputs (in order):
 
-    * ``"actions"`` — ``[1, num_actions]`` joint position targets.
-    * ``"attn_weights"`` — ``[1, num_legs]`` cross-attention scores averaged
-      over heads.  Entry ``[0, l]`` is the weight the base token places on leg
-      ``l``.  Useful for visualising which legs drive the ZMP estimate.
+    * ``"actions"``      — ``[1, num_actions]`` joint position targets.
+    * ``"attn_weights"`` — ``[1, num_legs]`` cross-attention scores averaged over
+      heads. Entry ``[0, l]`` is the attention weight on leg ``l``.
+    * ``"mu_zmp"``       — ``[1, 2]`` ZMP shift mean ``[delta_x, delta_y]``.
+    * ``"sigma2"``       — ``[1, 2]`` ZMP variance ``[sigma2_x, sigma2_y]``
+      (``= exp(logvar_zmp)``).
+
+    A companion ``policy_debug_metadata.json`` is written next to the ONNX file
+    documenting the output layout and **leg order** for ``attn_weights``.
 
     Args:
         policy: The ``STZMPStudentTeacher`` module returned by the runner.
@@ -393,29 +401,67 @@ def export_stzmp_policy_debug_as_onnx(
     os.makedirs(path, exist_ok=True)
     module.to("cpu").eval()
     example = torch.zeros(1, module._obs_dim)
+    onnx_path = os.path.join(path, filename)
     torch.onnx.export(
         module,
         example,
-        os.path.join(path, filename),
+        onnx_path,
         export_params=True,
         opset_version=18,
         verbose=verbose,
         input_names=["obs"],
-        output_names=["actions", "attn_weights"],
+        output_names=["actions", "attn_weights", "mu_zmp", "sigma2"],
         dynamic_axes={},
     )
-    print(f"[STZMP export] Debug ONNX (actions + attn) saved → {os.path.join(path, filename)}")
+    print(f"[STZMP export] Debug ONNX saved → {onnx_path}")
+
+    # Write companion metadata JSON so consumers know the output layout / leg order
+    leg_names: list[str] = getattr(policy, "leg_names", [f"leg_{i}" for i in range(policy.num_legs)])
+    leg_joint_indices = [
+        getattr(policy, f"_leg_idx_{i}").tolist()
+        for i in range(policy._num_leg_index_sets)
+    ]
+    with torch.no_grad():
+        dummy_out = module(example)
+    metadata = {
+        "onnx_file": filename,
+        "obs_dim": module._obs_dim,
+        "outputs": [
+            {"name": "actions",      "index": 0, "shape": list(dummy_out[0].shape),
+             "description": "joint position targets"},
+            {"name": "attn_weights", "index": 1, "shape": list(dummy_out[1].shape),
+             "description": "cross-attention scores per leg (sum to ~1)"},
+            {"name": "mu_zmp",       "index": 2, "shape": list(dummy_out[2].shape),
+             "description": "ZMP shift mean [delta_x, delta_y] in body frame"},
+            {"name": "sigma2",       "index": 3, "shape": list(dummy_out[3].shape),
+             "description": "ZMP variance [sigma2_x, sigma2_y] = exp(logvar_zmp)"},
+        ],
+        "leg_order": {str(i): name for i, name in enumerate(leg_names)},
+        "leg_joint_indices": leg_joint_indices,
+        "note": (
+            "attn_weights[0, l] is the attention the base-token (query) places on "
+            "leg l. Use leg_order to map index l to a leg name."
+        ),
+    }
+    meta_path = os.path.join(path, filename.replace(".onnx", "_metadata.json"))
+    with open(meta_path, "w") as f:
+        json.dump(metadata, f, indent=2)
+    print(f"[STZMP export] Debug metadata   saved → {meta_path}")
 
 
 class _STZMPDebugExportModule(_STZMPExportModule):
-    """Like :class:`_STZMPExportModule` but returns ``(actions, attn_weights)``.
+    """Like :class:`_STZMPExportModule` but returns all four diagnostic outputs.
 
-    The second output ``attn_weights`` has shape ``[1, num_legs]`` (heads
-    averaged, query dimension squeezed).  Intended for on-robot logging and
-    paper figures — not used in production inference.
+    Outputs (in order):
+      0. ``actions``      — ``[B, num_actions]``
+      1. ``attn_weights`` — ``[B, num_legs]``  (heads averaged, query squeezed)
+      2. ``mu_zmp``       — ``[B, 2]``  ZMP shift mean
+      3. ``sigma2``       — ``[B, 2]``  ZMP variance = exp(logvar_zmp)
     """
 
-    def forward(self, flat_obs: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    def forward(
+        self, flat_obs: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         B = flat_obs.shape[0]
         H = self._history_len
         N = self._num_joints
@@ -439,26 +485,28 @@ class _STZMPDebugExportModule(_STZMPExportModule):
             leg_token_list.append(torch.cat([q, dq, a], dim=-1))
         leg_tokens = torch.stack(leg_token_list, dim=1)
 
-        base_current = torch.cat([proj_gravity, base_ang_vel], dim=-1)
+        # Task-conditioned base token (same as production)
+        base_current = torch.cat([proj_gravity, base_ang_vel, base_lin_vel, command], dim=-1)
 
-        # Request attention weights (need_weights=True branch)
+        # Encoder with attention weights requested
         mu_zmp, logvar_zmp, _, attn_weights = self.encoder(
             leg_tokens, base_current, deterministic=True, return_attn_weights=True
         )
-        # attn_weights: [B, 1, num_legs] → [B, num_legs]
         assert attn_weights is not None
-        attn_weights = attn_weights.squeeze(1)
+        attn_weights = attn_weights.squeeze(1)   # [B, 1, L] → [B, L]
+        sigma2 = torch.exp(logvar_zmp)           # [B, 2]
 
         joint_pos_cur = joint_pos_hist[:, idx_cur, :]
         joint_vel_cur = joint_vel_hist[:, idx_cur, :]
-        actions_cur = action_hist[:, idx_cur, :]
+        actions_recent = action_hist[:, self._actor_act_start : self._actor_act_end, :].reshape(B, -1)
 
         actor_input = torch.cat(
             [
-                joint_pos_cur, joint_vel_cur, actions_cur,
+                joint_pos_cur, joint_vel_cur, actions_recent,
                 base_lin_vel, base_ang_vel, proj_gravity,
                 command, height_scan, mu_zmp, logvar_zmp,
             ],
             dim=-1,
         )
-        return self.student_actor(actor_input), attn_weights
+        actions = self.student_actor(actor_input)
+        return actions, attn_weights, mu_zmp, sigma2
